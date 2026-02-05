@@ -1,4 +1,6 @@
-import { createMcpHandler } from "mcp-handler";
+export const runtime = "nodejs";
+
+import { createMcpHandler } from "@vercel/mcp-adapter";
 import { z } from "zod";
 import axios from "axios";
 import SwaggerParser from "@apidevtools/swagger-parser";
@@ -12,12 +14,10 @@ import { OpenAPIV2, OpenAPIV3 } from "openapi-types";
 function resolveBaseUrl(
   api: OpenAPIV2.Document | OpenAPIV3.Document
 ): string | null {
-  // OpenAPI v3
   if ("servers" in api && api.servers?.length) {
     return api.servers[0].url;
   }
 
-  // Swagger v2
   if ("host" in api && api.host) {
     const scheme = api.schemes?.[0] ?? "https";
     return `${scheme}://${api.host}${api.basePath ?? ""}`;
@@ -28,7 +28,7 @@ function resolveBaseUrl(
 
 /**
  * =========================
- * MCP Handler
+ * MCP Handler (Vercel)
  * =========================
  */
 const handler = createMcpHandler((server) => {
@@ -39,40 +39,52 @@ const handler = createMcpHandler((server) => {
     "load-swagger",
     "Load and inspect Swagger/OpenAPI specification",
     {
-      url: z.string().describe("Swagger/OpenAPI JSON or YAML URL"),
+      url: z.string(),
     },
     async ({ url }) => {
-      const response = await axios.get(url, {
-        timeout: 10_000,
-        maxContentLength: 5 * 1024 * 1024,
-      });
+      try {
+        if (!url.startsWith("https://")) {
+          throw new Error("Only HTTPS URLs are allowed");
+        }
 
-      const swaggerDoc = response.data;
+        const response = await axios.get(url, {
+          timeout: 10_000,
+          maxContentLength: 5 * 1024 * 1024,
+        });
 
-      if (!swaggerDoc || (!swaggerDoc.openapi && !swaggerDoc.swagger)) {
-        throw new Error("Invalid Swagger/OpenAPI document");
+        const swaggerDoc = response.data;
+
+        if (!swaggerDoc || (!swaggerDoc.openapi && !swaggerDoc.swagger)) {
+          throw new Error("Invalid Swagger/OpenAPI document");
+        }
+
+        const api = (await SwaggerParser.validate(swaggerDoc, {
+          resolve: { external: false },
+        })) as OpenAPIV2.Document | OpenAPIV3.Document;
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  baseUrl: resolveBaseUrl(api),
+                  endpoints: Object.keys(api.paths ?? {}).length,
+                  paths: Object.keys(api.paths ?? {}),
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (err: unknown) {
+        return {
+          content: [
+            { type: "text", text: `❌ Swagger load failed: ${err instanceof Error ? err.message : String(err)}` },
+          ],
+        };
       }
-
-      const api = (await SwaggerParser.validate(
-        swaggerDoc
-      )) as OpenAPIV2.Document | OpenAPIV3.Document;
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                baseUrl: resolveBaseUrl(api),
-                endpoints: Object.keys(api.paths ?? {}).length,
-                paths: Object.keys(api.paths ?? {}),
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
     }
   );
 
@@ -89,23 +101,28 @@ const handler = createMcpHandler((server) => {
       tokenField: z.string().default("token"),
     },
     async ({ baseUrl, path, body, tokenField }) => {
-      const response = await axios.post(`${baseUrl}${path}`, body, {
-        timeout: 10_000,
-      });
+      try {
+        const response = await axios.post(`${baseUrl}${path}`, body ?? {}, {
+          timeout: 10_000,
+        });
 
-      const token = response.data?.[tokenField];
-      if (typeof token !== "string") {
-        throw new Error("Token not found in response");
+        const token = response.data?.[tokenField];
+        if (typeof token !== "string") {
+          throw new Error("Token not found in response");
+        }
+
+        return {
+          content: [
+            { type: "text", text: JSON.stringify({ token }, null, 2) },
+          ],
+        };
+      } catch (err: unknown) {
+        return {
+          content: [
+            { type: "text", text: `❌ Login failed: ${err instanceof Error ? err.message : String(err)}` },
+          ],
+        };
       }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ token }, null, 2),
-          },
-        ],
-      };
     }
   );
 
@@ -124,25 +141,30 @@ const handler = createMcpHandler((server) => {
       authToken: z.string().optional(),
     },
     async ({ baseUrl, method, path, query, body, authToken }) => {
-      const response = await axios({
-        method,
-        url: `${baseUrl}${path}`,
-        params: query,
-        data: body,
-        headers: authToken
-          ? { Authorization: `Bearer ${authToken}` }
-          : {},
-        timeout: 10_000,
-      });
+      try {
+        const response = await axios({
+          method,
+          url: `${baseUrl}${path}`,
+          params: query,
+          data: body,
+          headers: authToken
+            ? { Authorization: `Bearer ${authToken}` }
+            : {},
+          timeout: 10_000,
+        });
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(response.data, null, 2),
-          },
-        ],
-      };
+        return {
+          content: [
+            { type: "text", text: JSON.stringify(response.data, null, 2) },
+          ],
+        };
+      } catch (err: unknown) {
+        return {
+          content: [
+            { type: "text", text: `❌ API call failed: ${err instanceof Error ? err.message : String(err)}` },
+          ],
+        };
+      }
     }
   );
 });
