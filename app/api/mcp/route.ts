@@ -1,15 +1,14 @@
-export const runtime = "nodejs";
-
 import { createMcpHandler } from "@vercel/mcp-adapter";
 import { z } from "zod";
 import axios from "axios";
 import SwaggerParser from "@apidevtools/swagger-parser";
 import { OpenAPIV2, OpenAPIV3 } from "openapi-types";
 
+export const runtime = "nodejs";
+export const maxDuration = 30;
+
 /**
- * =========================
  * Utils
- * =========================
  */
 function resolveBaseUrl(
   api: OpenAPIV2.Document | OpenAPIV3.Document
@@ -27,19 +26,15 @@ function resolveBaseUrl(
 }
 
 /**
- * =========================
- * MCP Handler (Vercel)
- * =========================
+ * MCP Handler
  */
 const handler = createMcpHandler((server) => {
-  /**
-   * TOOL 1: Load Swagger
-   */
+  
   server.tool(
     "load-swagger",
     "Load and inspect Swagger/OpenAPI specification",
     {
-      url: z.string(),
+      url: z.string().describe("HTTPS URL to Swagger/OpenAPI spec"),
     },
     async ({ url }) => {
       try {
@@ -50,6 +45,9 @@ const handler = createMcpHandler((server) => {
         const response = await axios.get(url, {
           timeout: 10_000,
           maxContentLength: 5 * 1024 * 1024,
+          headers: {
+            'Accept': 'application/json, application/yaml',
+          }
         });
 
         const swaggerDoc = response.data;
@@ -68,6 +66,7 @@ const handler = createMcpHandler((server) => {
               type: "text",
               text: JSON.stringify(
                 {
+                  success: true,
                   baseUrl: resolveBaseUrl(api),
                   endpoints: Object.keys(api.paths ?? {}).length,
                   paths: Object.keys(api.paths ?? {}),
@@ -79,66 +78,83 @@ const handler = createMcpHandler((server) => {
           ],
         };
       } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
         return {
           content: [
-            { type: "text", text: `❌ Swagger load failed: ${err instanceof Error ? err.message : String(err)}` },
+            { 
+              type: "text", 
+              text: JSON.stringify({
+                success: false,
+                error: errorMessage
+              }, null, 2)
+            },
           ],
         };
       }
     }
   );
 
-  /**
-   * TOOL 2: Login
-   */
   server.tool(
     "login",
-    "Login and return auth token",
+    "Login to API and return authentication token",
     {
-      baseUrl: z.string(),
-      path: z.string(),
-      body: z.record(z.string(), z.unknown()).optional(),
-      tokenField: z.string().default("token"),
+      baseUrl: z.string().describe("Base URL of the API"),
+      path: z.string().describe("Login endpoint path (e.g., /auth/login)"),
+      body: z.record(z.string(), z.unknown()).optional().describe("Login credentials"),
+      tokenField: z.string().default("token").describe("Field name containing the token in response"),
     },
     async ({ baseUrl, path, body, tokenField }) => {
       try {
         const response = await axios.post(`${baseUrl}${path}`, body ?? {}, {
           timeout: 10_000,
+          headers: {
+            'Content-Type': 'application/json',
+          }
         });
 
         const token = response.data?.[tokenField];
         if (typeof token !== "string") {
-          throw new Error("Token not found in response");
+          throw new Error(`Token field '${tokenField}' not found in response`);
         }
 
         return {
           content: [
-            { type: "text", text: JSON.stringify({ token }, null, 2) },
+            { 
+              type: "text", 
+              text: JSON.stringify({ 
+                success: true,
+                token 
+              }, null, 2) 
+            },
           ],
         };
       } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
         return {
           content: [
-            { type: "text", text: `❌ Login failed: ${err instanceof Error ? err.message : String(err)}` },
+            { 
+              type: "text", 
+              text: JSON.stringify({
+                success: false,
+                error: errorMessage
+              }, null, 2)
+            },
           ],
         };
       }
     }
   );
 
-  /**
-   * TOOL 3: Call API
-   */
   server.tool(
     "call-api",
-    "Call any API endpoint",
+    "Call any API endpoint with optional authentication",
     {
-      baseUrl: z.string(),
-      method: z.enum(["GET", "POST", "PUT", "DELETE", "PATCH"]),
-      path: z.string(),
-      query: z.record(z.string(), z.unknown()).optional(),
-      body: z.record(z.string(), z.unknown()).optional(),
-      authToken: z.string().optional(),
+      baseUrl: z.string().describe("Base URL of the API"),
+      method: z.enum(["GET", "POST", "PUT", "DELETE", "PATCH"]).describe("HTTP method"),
+      path: z.string().describe("API endpoint path"),
+      query: z.record(z.string(), z.unknown()).optional().describe("Query parameters"),
+      body: z.record(z.string(), z.unknown()).optional().describe("Request body"),
+      authToken: z.string().optional().describe("Bearer authentication token"),
     },
     async ({ baseUrl, method, path, query, body, authToken }) => {
       try {
@@ -147,21 +163,43 @@ const handler = createMcpHandler((server) => {
           url: `${baseUrl}${path}`,
           params: query,
           data: body,
-          headers: authToken
-            ? { Authorization: `Bearer ${authToken}` }
-            : {},
+          headers: {
+            ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+            'Content-Type': 'application/json',
+          },
           timeout: 10_000,
         });
 
         return {
           content: [
-            { type: "text", text: JSON.stringify(response.data, null, 2) },
+            { 
+              type: "text", 
+              text: JSON.stringify({
+                success: true,
+                data: response.data,
+                status: response.status
+              }, null, 2) 
+            },
           ],
         };
       } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        const axiosError = axios.isAxiosError(err) ? {
+          status: err.response?.status,
+          statusText: err.response?.statusText,
+          data: err.response?.data
+        } : null;
+
         return {
           content: [
-            { type: "text", text: `❌ API call failed: ${err instanceof Error ? err.message : String(err)}` },
+            { 
+              type: "text", 
+              text: JSON.stringify({
+                success: false,
+                error: errorMessage,
+                ...(axiosError && { details: axiosError })
+              }, null, 2)
+            },
           ],
         };
       }
@@ -169,7 +207,6 @@ const handler = createMcpHandler((server) => {
   );
 });
 
-/**
- * MCP supports multiple HTTP methods
- */
-export { handler as GET, handler as POST };
+// Export the same handler for both GET and POST
+export const GET = handler;
+export const POST = handler;
